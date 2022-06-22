@@ -56,7 +56,11 @@ def limit_resource(memory_limit, time_limit):
     if memory_limit > 0:
         soft, hard = resource.getrlimit(resource.RLIMIT_AS)
         if soft < 0 and (hard < 0 or memory_limit <= hard) or memory_limit < soft:
-            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, hard))
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (int(memory_limit), hard))
+            except ValueError:
+                # According to https://bugs.python.org/issue40518, it's a mac-specific error.
+                pass
     main_thread = False
     if time_limit is not None:
         try:
@@ -151,7 +155,8 @@ class BaseEstimator:
         X_train = self._preprocess(X_train)
         model = self.estimator_class(**self.params)
         if logger.level == logging.DEBUG:
-            logger.debug(f"flaml.model - {model} fit started")
+            # xgboost 1.6 doesn't display all the params in the model str
+            logger.debug(f"flaml.model - {model} fit started with params {self.params}")
         model.fit(X_train, y_train, **kwargs)
         if logger.level == logging.DEBUG:
             logger.debug(f"flaml.model - {model} fit finished")
@@ -547,7 +552,6 @@ class TransformersEstimator(BaseEstimator):
                 add_prefix_space=True
                 if "roberta" in self._training_args.model_path
                 else False,  # If roberta model, must set add_prefix_space to True to avoid the assertion error at
-
                 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/roberta/tokenization_roberta_fast.py#L249
             )
 
@@ -949,17 +953,13 @@ class LGBMEstimator(BaseEstimator):
                 "low_cost_init_value": 4,
             },
             "min_child_samples": {
-                "domain": tune.lograndint(lower=2, upper=2 ** 7 + 1),
+                "domain": tune.lograndint(lower=2, upper=2**7 + 1),
                 "init_value": 20,
             },
             "learning_rate": {
                 "domain": tune.loguniform(lower=1 / 1024, upper=1.0),
                 "init_value": 0.1,
             },
-            # 'subsample': {
-            #     'domain': tune.uniform(lower=0.1, upper=1.0),
-            #     'init_value': 1.0,
-            # },
             "log_max_bin": {  # log transformed with base 2
                 "domain": tune.lograndint(lower=3, upper=11),
                 "init_value": 8,
@@ -1052,7 +1052,6 @@ class LGBMEstimator(BaseEstimator):
                 self.params[self.ITER_HP] = 1
                 self._t1 = self._fit(X_train, y_train, **kwargs)
                 if budget is not None and self._t1 >= budget or n_iter == 1:
-                    # self.params[self.ITER_HP] = n_iter
                     return self._t1
                 mem1 = psutil.virtual_memory().available if psutil is not None else 1
                 self._mem1 = mem0 - mem1
@@ -1113,12 +1112,23 @@ class LGBMEstimator(BaseEstimator):
                 kwargs.pop("callbacks")
             else:
                 callbacks = self._callbacks(start_time, deadline)
+            if isinstance(self, XGBoostSklearnEstimator):
+                from xgboost import __version__
+
+                if __version__ >= "1.6.0":
+                    # since xgboost>=1.6.0, callbacks can't be passed in fit()
+                    self.params["callbacks"] = callbacks
+                    callbacks = None
             self._fit(
                 X_train,
                 y_train,
                 callbacks=callbacks,
                 **kwargs,
             )
+            if callbacks is None:
+                # for xgboost>=1.6.0, pop callbacks to enable pickle
+                callbacks = self.params.pop("callbacks")
+                self._model.set_params(callbacks=callbacks[:-1])
             best_iteration = (
                 self._model.get_booster().best_iteration
                 if isinstance(self, XGBoostSklearnEstimator)
@@ -1173,7 +1183,7 @@ class XGBoostEstimator(SKLearnEstimator):
             },
             "min_child_weight": {
                 "domain": tune.loguniform(lower=0.001, upper=128),
-                "init_value": 1,
+                "init_value": 1.0,
             },
             "learning_rate": {
                 "domain": tune.loguniform(lower=1 / 1024, upper=1.0),
@@ -1235,7 +1245,9 @@ class XGBoostEstimator(SKLearnEstimator):
         start_time = time.time()
         deadline = start_time + budget if budget else np.inf
         if issparse(X_train):
-            self.params["tree_method"] = "auto"
+            if xgb.__version__ < "1.6.0":
+                # "auto" fails for sparse input since xgboost 1.6.0
+                self.params["tree_method"] = "auto"
         else:
             X_train = self._preprocess(X_train)
         if "sample_weight" in kwargs:
@@ -1339,9 +1351,11 @@ class XGBoostSklearnEstimator(SKLearnEstimator, LGBMEstimator):
             self.estimator_class = xgb.XGBRanker
         elif task in CLASSIFICATION:
             self.estimator_class = xgb.XGBClassifier
+        self._xgb_version = xgb.__version__
 
     def fit(self, X_train, y_train, budget=None, **kwargs):
-        if issparse(X_train):
+        if issparse(X_train) and self._xgb_version < "1.6.0":
+            # "auto" fails for sparse input since xgboost 1.6.0
             self.params["tree_method"] = "auto"
         if kwargs.get("gpu_per_trial"):
             self.params["tree_method"] = "gpu_hist"
@@ -1802,17 +1816,17 @@ class ARIMA(Prophet):
     def search_space(cls, **params):
         space = {
             "p": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 2,
                 "low_cost_init_value": 0,
             },
             "d": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 2,
                 "low_cost_init_value": 0,
             },
             "q": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 1,
                 "low_cost_init_value": 0,
             },
@@ -1889,32 +1903,32 @@ class SARIMAX(ARIMA):
     def search_space(cls, **params):
         space = {
             "p": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 2,
                 "low_cost_init_value": 0,
             },
             "d": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 2,
                 "low_cost_init_value": 0,
             },
             "q": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 1,
                 "low_cost_init_value": 0,
             },
             "P": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 1,
                 "low_cost_init_value": 0,
             },
             "D": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 1,
                 "low_cost_init_value": 0,
             },
             "Q": {
-                "domain": tune.quniform(lower=0, upper=10, q=1),
+                "domain": tune.qrandint(lower=0, upper=10, q=1),
                 "init_value": 1,
                 "low_cost_init_value": 0,
             },
